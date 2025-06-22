@@ -1,0 +1,635 @@
+From 13e8cabcf11ac6ebb8fd7892c9f0d73ba437df1d Mon Sep 17 00:00:00 2001
+From: Sudharshan Muralidharan
+ <157102595+sudharshanibm@users.noreply.github.com>
+Date: Sun, 22 Jun 2025 16:07:11 +0530
+Subject: [PATCH] s390x support changes
+
+---
+ ...shorthand_fields-remove-translate_ba.patch | 468 ++++++++++++++++++
+ kong-s390x-support.patch                      |   0
+ kong.patch                                    | 133 +++++
+ 3 files changed, 601 insertions(+)
+ create mode 100644 0001-Revert-refactor-shorthand_fields-remove-translate_ba.patch
+ create mode 100644 kong-s390x-support.patch
+ create mode 100644 kong.patch
+
+diff --git a/0001-Revert-refactor-shorthand_fields-remove-translate_ba.patch b/0001-Revert-refactor-shorthand_fields-remove-translate_ba.patch
+new file mode 100644
+index 000000000..8803ccd65
+--- /dev/null
++++ b/0001-Revert-refactor-shorthand_fields-remove-translate_ba.patch
+@@ -0,0 +1,468 @@
++From 76dc1bad8384b29c685222d64e0234f211396199 Mon Sep 17 00:00:00 2001
++From: =?UTF-8?q?Miko=C5=82aj=20Nowak?= <mikolaj.nowak@konghq.com>
++Date: Fri, 9 May 2025 11:20:42 +0200
++Subject: [PATCH] Revert "refactor(shorthand_fields): remove
++ translate_backwards in favor of replaced_with (#13604)"
++
++This reverts commit 11405e5d4d2d88db746dd6ae0b700bc94f9fbe47.
++---
++ .../kong/revert-translate-backwards.yml       |   3 +
++ kong/db/schema/init.lua                       |  51 +++-
++ kong/db/schema/metaschema.lua                 |   1 +
++ ...rthand_fields_translate_backwards_spec.lua | 274 ++++++++++++++++++
++ .../handler.lua                               |  12 +
++ .../schema.lua                                |  25 ++
++ 6 files changed, 354 insertions(+), 12 deletions(-)
++ create mode 100644 changelog/unreleased/kong/revert-translate-backwards.yml
++ create mode 100644 spec/02-integration/03-db/23-shorthand_fields_translate_backwards_spec.lua
++ create mode 100644 spec/fixtures/custom_plugins/kong/plugins/translate-backwards-older-plugin/handler.lua
++ create mode 100644 spec/fixtures/custom_plugins/kong/plugins/translate-backwards-older-plugin/schema.lua
++
++diff --git a/changelog/unreleased/kong/revert-translate-backwards.yml b/changelog/unreleased/kong/revert-translate-backwards.yml
++new file mode 100644
++index 000000000..c88a8c846
++--- /dev/null
+++++ b/changelog/unreleased/kong/revert-translate-backwards.yml
++@@ -0,0 +1,3 @@
+++message: Reverted removal of `translate_backwards` from plugins' metaschema in order to maintain backward compatibility.
+++type: bugfix
+++scope: Core
++diff --git a/kong/db/schema/init.lua b/kong/db/schema/init.lua
++index 9804ed017..8834e8436 100644
++--- a/kong/db/schema/init.lua
+++++ b/kong/db/schema/init.lua
++@@ -1746,18 +1746,35 @@ local function validate_deprecation_exclusiveness(data, shorthand_value, shortha
++   if shorthand_value == nil or
++       shorthand_value == ngx.null or
++       shorthand_definition.deprecation == nil or
++-      shorthand_definition.deprecation.replaced_with == nil then
+++      (shorthand_definition.deprecation.replaced_with == nil and shorthand_definition.translate_backwards == nil) then
++     return true
++   end
++ 
++-  for _, replaced_with_element in ipairs(shorthand_definition.deprecation.replaced_with) do
++-    local new_field_value = replaced_with_element.reverse_mapping_function and replaced_with_element.reverse_mapping_function(data)
++-                                                                            or table_path(data, replaced_with_element.path)
+++  if shorthand_definition.deprecation.replaced_with then
+++    for _, replaced_with_element in ipairs(shorthand_definition.deprecation.replaced_with) do
+++      local new_field_value = replaced_with_element.reverse_mapping_function and replaced_with_element.reverse_mapping_function(data)
+++                                                                              or table_path(data, replaced_with_element.path)
+++
+++      if new_field_value and
+++        new_field_value ~= ngx.null and
+++        not deepcompare(new_field_value, shorthand_value) then
+++        local new_field_name = join_string(".", replaced_with_element.path)
+++
+++        return nil, string.format(
+++          "both deprecated and new field are used but their values mismatch: %s = %s vs %s = %s",
+++          shorthand_name, tostring(shorthand_value),
+++          new_field_name, tostring(new_field_value)
+++        )
+++      end
+++    end
+++  elseif shorthand_definition.translate_backwards then
+++    local new_field_value = shorthand_definition.translate_backwards_with and shorthand_definition.translate_backwards_with(data)
+++                                                                          or table_path(data, shorthand_definition.translate_backwards)
++ 
++     if new_field_value and
++-      new_field_value ~= ngx.null and
++-      not deepcompare(new_field_value, shorthand_value) then
++-      local new_field_name = join_string(".", replaced_with_element.path)
+++        new_field_value ~= ngx.null and
+++        not deepcompare(new_field_value, shorthand_value) then
+++        local new_field_name = join_string(".", shorthand_definition.translate_backwards)
++ 
++       return nil, string.format(
++         "both deprecated and new field are used but their values mismatch: %s = %s vs %s = %s",
++@@ -1847,10 +1864,16 @@ function Schema:process_auto_fields(data, context, nulls, opts)
++                                                     sdata.deprecation.replaced_with[1]
++         if replaced_with then
++           if replaced_with.reverse_mapping_function then
++-          data[sname] = replaced_with.reverse_mapping_function(data)
+++            data[sname] = replaced_with.reverse_mapping_function(data)
++           else
++             data[sname] = table_path(data, replaced_with.path)
++           end
+++
+++        -- Falling back to processing `translate_backwards` for backwards compatibility
+++        -- this might be the case when someone is using `rate-limiting`, `acme`, `response-ratelimiting` plugin
+++        -- from version 3.6.x or 3.7.x
+++        elseif sdata.translate_backwards then
+++          data[sname] = table_path(data, sdata.translate_backwards)
++         end
++       end
++     end
++@@ -2000,21 +2023,25 @@ function Schema:process_auto_fields(data, context, nulls, opts)
++     elseif not ((key == "ttl"   and self.ttl) or
++                 (key == "ws_id" and show_ws)) then
++ 
++-      local should_be_in_ouput = false
+++      local should_be_in_output = false
++ 
++       if self.shorthand_fields then
++         for _, shorthand_field in ipairs(self.shorthand_fields) do
++           if shorthand_field[key] then
++             local replaced_with = shorthand_field[key].deprecation and shorthand_field[key].deprecation.replaced_with and
++                                                                         #shorthand_field[key].deprecation.replaced_with[1]
++-            if replaced_with then
++-              should_be_in_ouput = is_select
+++
+++            -- Either using replaced_with or falling back to processing `translate_backwards` for backwards compatibility
+++            -- this might be the case when someone is using `rate-limiting`, `acme`, `response-ratelimiting` plugin
+++            -- from version 3.6.x or 3.7.x
+++            if replaced_with or shorthand_field[key].translate_backwards then
+++              should_be_in_output = is_select
++             end
++           end
++         end
++       end
++ 
++-      if not should_be_in_ouput then
+++      if not should_be_in_output then
++         data[key] = nil
++       end
++     end
++diff --git a/kong/db/schema/metaschema.lua b/kong/db/schema/metaschema.lua
++index 1ea7c9588..554e59ead 100644
++--- a/kong/db/schema/metaschema.lua
+++++ b/kong/db/schema/metaschema.lua
++@@ -716,6 +716,7 @@ local function make_shorthand_field_schema()
++   shorthand_field_schema[1] = { type = { type = "string", one_of = shorthand_field_types, required = true }, }
++ 
++   insert(shorthand_field_schema, { func = { type = "function", required = true } })
+++  insert(shorthand_field_schema, { translate_backwards = { type = "array", elements = { type = "string" }, required = false } })
++   return shorthand_field_schema
++ end
++ 
++diff --git a/spec/02-integration/03-db/23-shorthand_fields_translate_backwards_spec.lua b/spec/02-integration/03-db/23-shorthand_fields_translate_backwards_spec.lua
++new file mode 100644
++index 000000000..68a57adab
++--- /dev/null
+++++ b/spec/02-integration/03-db/23-shorthand_fields_translate_backwards_spec.lua
++@@ -0,0 +1,274 @@
+++local helpers = require "spec.helpers"
+++local cjson = require "cjson"
+++local uuid = require("kong.tools.uuid").uuid
+++
+++
+++describe("an old plugin: translate_backwards", function()
+++  local bp, db, route, admin_client
+++  local plugin_id = uuid()
+++
+++  lazy_setup(function()
+++    helpers.test_conf.lua_package_path = helpers.test_conf.lua_package_path .. ";./spec-ee/fixtures/custom_plugins/?.lua"
+++    bp, db = helpers.get_db_utils(nil, {
+++      "plugins",
+++    }, { 'translate-backwards-older-plugin' })
+++
+++    route = assert(bp.routes:insert {
+++      hosts = { "redis.test" },
+++    })
+++
+++    assert(helpers.start_kong({
+++      plugins = "bundled,translate-backwards-older-plugin",
+++      nginx_conf = "spec/fixtures/custom_nginx.template",
+++      lua_package_path  = "?./spec-ee/fixtures/custom_plugins/?.lua",
+++    }))
+++
+++    admin_client = assert(helpers.admin_client())
+++  end)
+++
+++  lazy_teardown(function()
+++    if admin_client then
+++      admin_client:close()
+++    end
+++
+++    helpers.stop_kong()
+++  end)
+++
+++  describe("when creating custom plugin", function()
+++    after_each(function()
+++      db:truncate("plugins")
+++    end)
+++
+++    describe("when using the new field", function()
+++      it("creates the custom plugin and fills in old field in response", function()
+++        -- POST
+++        local res = assert(admin_client:send {
+++          method = "POST",
+++          route = {
+++            id = route.id
+++          },
+++          path = "/plugins",
+++          headers = { ["Content-Type"] = "application/json" },
+++          body = {
+++            id = plugin_id,
+++            name = "translate-backwards-older-plugin",
+++            config = {
+++              new_field = "ABC"
+++            },
+++          },
+++        })
+++
+++        local json = cjson.decode(assert.res_status(201, res))
+++        assert.same(json.config.new_field, "ABC")
+++        assert.same(json.config.old_field, "ABC")
+++
+++        -- PATCH
+++        res = assert(admin_client:send {
+++          method = "PATCH",
+++          path = "/plugins/" .. plugin_id,
+++          headers = { ["Content-Type"] = "application/json" },
+++          body = {
+++            name = "translate-backwards-older-plugin",
+++            config = {
+++              new_field = "XYZ"
+++            },
+++          },
+++        })
+++
+++        json = cjson.decode(assert.res_status(200, res))
+++        assert.same(json.config.new_field, "XYZ")
+++        assert.same(json.config.old_field, "XYZ")
+++
+++        -- GET
+++        res = assert(admin_client:send {
+++          method = "GET",
+++          path = "/plugins/" .. plugin_id
+++        })
+++
+++        json = cjson.decode(assert.res_status(200, res))
+++        assert.same(json.config.new_field, "XYZ")
+++        assert.same(json.config.old_field, "XYZ")
+++      end)
+++    end)
+++
+++    describe("when using the old field", function()
+++      it("creates the custom plugin and fills in old field in response", function()
+++        -- POST
+++        local res = assert(admin_client:send {
+++          method = "POST",
+++          route = {
+++            id = route.id
+++          },
+++          path = "/plugins",
+++          headers = { ["Content-Type"] = "application/json" },
+++          body = {
+++            id = plugin_id,
+++            name = "translate-backwards-older-plugin",
+++            config = {
+++              old_field = "ABC"
+++            },
+++          },
+++        })
+++
+++        local json = cjson.decode(assert.res_status(201, res))
+++        assert.same(json.config.new_field, "ABC")
+++        assert.same(json.config.old_field, "ABC")
+++
+++        -- PATCH
+++        res = assert(admin_client:send {
+++          method = "PATCH",
+++          path = "/plugins/" .. plugin_id,
+++          headers = { ["Content-Type"] = "application/json" },
+++          body = {
+++            name = "translate-backwards-older-plugin",
+++            config = {
+++              old_field = "XYZ"
+++            },
+++          },
+++        })
+++
+++        json = cjson.decode(assert.res_status(200, res))
+++        assert.same(json.config.new_field, "XYZ")
+++        assert.same(json.config.old_field, "XYZ")
+++
+++        -- GET
+++        res = assert(admin_client:send {
+++          method = "GET",
+++          path = "/plugins/" .. plugin_id
+++        })
+++
+++        json = cjson.decode(assert.res_status(200, res))
+++        assert.same(json.config.new_field, "XYZ")
+++        assert.same(json.config.old_field, "XYZ")
+++      end)
+++    end)
+++
+++    describe("when using the both new and old fields", function()
+++      describe("when their values match", function()
+++        it("creates the custom plugin and fills in old field in response", function()
+++          -- POST
+++          local res = assert(admin_client:send {
+++            method = "POST",
+++            route = {
+++              id = route.id
+++            },
+++            path = "/plugins",
+++            headers = { ["Content-Type"] = "application/json" },
+++            body = {
+++              id = plugin_id,
+++              name = "translate-backwards-older-plugin",
+++              config = {
+++                new_field = "ABC",
+++                old_field = "ABC"
+++              },
+++            },
+++          })
+++
+++          local json = cjson.decode(assert.res_status(201, res))
+++          assert.same(json.config.new_field, "ABC")
+++          assert.same(json.config.old_field, "ABC")
+++
+++          -- PATCH
+++          res = assert(admin_client:send {
+++            method = "PATCH",
+++            path = "/plugins/" .. plugin_id,
+++            headers = { ["Content-Type"] = "application/json" },
+++            body = {
+++              name = "translate-backwards-older-plugin",
+++              config = {
+++                new_field = "XYZ",
+++                old_field = "XYZ"
+++              },
+++            },
+++          })
+++
+++          json = cjson.decode(assert.res_status(200, res))
+++          assert.same(json.config.new_field, "XYZ")
+++          assert.same(json.config.old_field, "XYZ")
+++
+++          -- GET
+++          res = assert(admin_client:send {
+++            method = "GET",
+++            path = "/plugins/" .. plugin_id
+++          })
+++
+++          json = cjson.decode(assert.res_status(200, res))
+++          assert.same(json.config.new_field, "XYZ")
+++          assert.same(json.config.old_field, "XYZ")
+++        end)
+++      end)
+++
+++      describe("when their values mismatch", function()
+++        it("rejects such plugin", function()
+++          -- POST --- with mismatched values
+++          local res = assert(admin_client:send {
+++            method = "POST",
+++            route = {
+++              id = route.id
+++            },
+++            path = "/plugins",
+++            headers = { ["Content-Type"] = "application/json" },
+++            body = {
+++              id = plugin_id,
+++              name = "translate-backwards-older-plugin",
+++              config = {
+++                new_field = "ABC",
+++                old_field = "XYZ"
+++              },
+++            },
+++          })
+++
+++          assert.res_status(400, res)
+++
+++          -- POST --- with correct values so that we can send PATCH below
+++          res = assert(admin_client:send {
+++            method = "POST",
+++            route = {
+++              id = route.id
+++            },
+++            path = "/plugins",
+++            headers = { ["Content-Type"] = "application/json" },
+++            body = {
+++              id = plugin_id,
+++              name = "translate-backwards-older-plugin",
+++              config = {
+++                new_field = "ABC",
+++                old_field = "ABC"
+++              },
+++            },
+++          })
+++
+++          local json = cjson.decode(assert.res_status(201, res))
+++          assert.same(json.config.new_field, "ABC")
+++          assert.same(json.config.old_field, "ABC")
+++
+++          -- PATCH
+++          res = assert(admin_client:send {
+++            method = "PATCH",
+++            path = "/plugins/" .. plugin_id,
+++            headers = { ["Content-Type"] = "application/json" },
+++            body = {
+++              name = "translate-backwards-older-plugin",
+++              config = {
+++                new_field = "EFG",
+++                old_field = "XYZ"
+++              },
+++            },
+++          })
+++
+++          assert.res_status(400, res)
+++
+++          -- GET
+++          res = assert(admin_client:send {
+++            method = "GET",
+++            path = "/plugins/" .. plugin_id
+++          })
+++
+++          json = cjson.decode(assert.res_status(200, res))
+++          assert.same(json.config.new_field, "ABC")
+++          assert.same(json.config.old_field, "ABC")
+++        end)
+++      end)
+++    end)
+++  end)
+++end)
++diff --git a/spec/fixtures/custom_plugins/kong/plugins/translate-backwards-older-plugin/handler.lua b/spec/fixtures/custom_plugins/kong/plugins/translate-backwards-older-plugin/handler.lua
++new file mode 100644
++index 000000000..761f0d2d8
++--- /dev/null
+++++ b/spec/fixtures/custom_plugins/kong/plugins/translate-backwards-older-plugin/handler.lua
++@@ -0,0 +1,12 @@
+++local kong = kong
+++
+++local TranslateBackwardsOlderPlugin = {
+++  PRIORITY = 1000,
+++  VERSION = "0.1.0",
+++}
+++
+++function TranslateBackwardsOlderPlugin:access(conf)
+++    kong.log("access phase")
+++end
+++
+++return TranslateBackwardsOlderPlugin
++diff --git a/spec/fixtures/custom_plugins/kong/plugins/translate-backwards-older-plugin/schema.lua b/spec/fixtures/custom_plugins/kong/plugins/translate-backwards-older-plugin/schema.lua
++new file mode 100644
++index 000000000..6007b3a7d
++--- /dev/null
+++++ b/spec/fixtures/custom_plugins/kong/plugins/translate-backwards-older-plugin/schema.lua
++@@ -0,0 +1,25 @@
+++return {
+++  name = "translate-backwards-older-plugin",
+++  fields = {
+++    {
+++      config = {
+++        type = "record",
+++        fields = {
+++          { new_field = { type = "string", default = "new-value" } },
+++        },
+++        shorthand_fields = {
+++          { old_field = {
+++            type = "string",
+++            translate_backwards = { 'new_field' },
+++            deprecation = {
+++              message = "translate-backwards-older-plugin: config.old_field is deprecated, please use config.new_field instead",
+++              removal_in_version = "4.0", },
+++            func = function(value)
+++              return { new_field = value }
+++            end
+++          } },
+++        },
+++      },
+++    },
+++  },
+++}
++-- 
++2.39.3 (Apple Git-146)
++
+diff --git a/kong-s390x-support.patch b/kong-s390x-support.patch
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/kong.patch b/kong.patch
+new file mode 100644
+index 000000000..6b5ac5d65
+--- /dev/null
++++ b/kong.patch
+@@ -0,0 +1,133 @@
++diff --git a/BUILD.bazel b/BUILD.bazel
++index 4602b77e0..6874c3a49 100644
++--- a/BUILD.bazel
+++++ b/BUILD.bazel
++@@ -186,7 +186,7 @@ config_setting(
++ # --//:wasmx=true
++ bool_flag(
++     name = "wasmx",
++-    build_setting_default = True,
+++    build_setting_default = False,
++     visibility = ["//visibility:public"],
++ )
++ 
++diff --git a/Makefile b/Makefile
++index c70b9f799..27f34669f 100644
++--- a/Makefile
+++++ b/Makefile
++@@ -122,7 +122,7 @@ install-dev-rocks: build-venv
++       fi \
++     done;
++ 
++-dev: install-rust-toolchain build-venv install-dev-rocks bin/grpcurl bin/h2client wasm-test-filters
+++dev: install-rust-toolchain build-venv install-dev-rocks bin/grpcurl bin/h2client
++ 
++ build-release: check-bazel
++     $(BAZEL) clean --expunge
++diff --git a/WORKSPACE b/WORKSPACE
++index bdc920470..e6780ab36 100644
++--- a/WORKSPACE
+++++ b/WORKSPACE
++@@ -48,12 +48,20 @@ rules_foreign_cc_dependencies(
++     register_preinstalled_tools = True,  # use preinstalled toolchains like make
++ )
++ 
++-http_archive(
+++local_repository(
+++    name = "gh_linux_s390x",
+++    path = "../gh_repo",
+++)
+++
+++local_repository(
++     name = "rules_rust",
++-    integrity = "sha256-JLN47ZcAbx9wEr5Jiib4HduZATGLiDgK7oUi/fvotzU=",
++-    urls = ["https://github.com/bazelbuild/rules_rust/releases/download/0.42.1/rules_rust-v0.42.1.tar.gz"],
+++    path = "../rules_rust",
++ )
++ 
+++load("@rules_rust//rust:repositories.bzl", "rust_register_toolchains", "rules_rust_dependencies")
+++rules_rust_dependencies()
+++rust_register_toolchains()
+++
++ load("//build:kong_bindings.bzl", "load_bindings")
++ 
++ load_bindings(name = "kong_bindings")
++diff --git a/build/build_system.bzl b/build/build_system.bzl
++index bfd45d067..369b8b627 100644
++--- a/build/build_system.bzl
+++++ b/build/build_system.bzl
++@@ -186,6 +186,8 @@ def _github_release_impl(ctx):
++         os_arch = "arm64"
++     elif os_arch == "x86_64":
++         os_arch = "amd64"
+++    elif os_arch == "s390x":
+++        os_arch = "s390x"
++     elif os_arch != "amd64":
++         fail("Unsupported arch %s" % os_arch)
++ 
++diff --git a/build/openresty/atc_router/BUILD.atc_router.bazel b/build/openresty/atc_router/BUILD.atc_router.bazel
++index bd87dfccd..53e56227b 100644
++--- a/build/openresty/atc_router/BUILD.atc_router.bazel
+++++ b/build/openresty/atc_router/BUILD.atc_router.bazel
++@@ -20,6 +20,7 @@ filegroup(
++ rust_shared_library(
++     name = "atc_router",
++     srcs = [":rust_srcs"],
+++    edition = "2021",
++     aliases = aliases(),
++     crate_features = [
++         "default",
++diff --git a/kong/pdk/nginx.lua b/kong/pdk/nginx.lua
++index f5715e03e..43e6d1e12 100644
++--- a/kong/pdk/nginx.lua
+++++ b/kong/pdk/nginx.lua
++@@ -12,7 +12,7 @@ local arch = ffi.arch
++ local ngx  = ngx
++ local tonumber = tonumber
++ 
++-if arch == "x64" or arch == "arm64" then
+++if arch == "x64" or arch == "arm64" or arch == "s390x" then
++   ffi.cdef[[
++     uint64_t *ngx_stat_active;
++     uint64_t *ngx_stat_reading;
++diff --git a/scripts/dependency_services/docker-compose-test-services.yml b/scripts/dependency_services/docker-compose-test-services.yml
++index 98d244d7b..e5f6e7a12 100644
++--- a/scripts/dependency_services/docker-compose-test-services.yml
+++++ b/scripts/dependency_services/docker-compose-test-services.yml
++@@ -38,23 +38,15 @@ services:
++       - 127.0.0.1::9000
++       - 127.0.0.1::9001
++   zipkin:
++     image: openzipkin/zipkin:latest
++     ports:
++       - 127.0.0.1::9411
++     command: --logging.level.zipkin2=DEBUG
++
++-  redis-auth:
++-    image: redis/redis-stack-server
++-    ports:
++-      - 127.0.0.1::6385
++-    environment:
++-      - REDIS_ARGS=--requirepass passdefault --port 6385
++-    volumes:
++-      - redis-auth-data:/data
++-    healthcheck:
++-      test: ["CMD", "redis-cli", "-p", "6385", "--pass", "passdefault", "ping"]
++-      interval: 5s
++-      timeout: 10s
++-      retries: 10
+++  redis:
+++    image: redis:latest
+++    ports:
+++      - 127.0.0.1:6379:6379
+++    volumes:
+++      - redis-data:/data
+++    healthcheck:
+++      test: ["CMD", "redis-cli", "ping"]
+++      interval: 5s
+++      timeout: 10s
+++      retries: 10
++
++ volumes:
++   postgres-data:
++   redis-data:
+\ No newline at end of file
+-- 
+2.39.3 (Apple Git-146)
+
